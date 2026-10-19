@@ -1,0 +1,7 @@
+# Секреты: токен бота и cookies никогда не должны попасть на GitHub
+.env
+cookies.txt
+
+venv/
+__pycache__/
+*.pyc

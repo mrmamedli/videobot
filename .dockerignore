@@ -1,0 +1,6 @@
+.env
+cookies.txt
+venv/
+__pycache__/
+.git/
+README.md

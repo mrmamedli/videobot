@@ -1,3 +1,4 @@
 aiogram>=3.13,<4
 yt-dlp[default,curl-cffi]
+gallery-dl
 python-dotenv>=1.0
