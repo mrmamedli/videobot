@@ -4,7 +4,9 @@
 Видео: качество по умолчанию 720p; если файл не влезает в лимит Telegram (50 МБ),
 бот пробует 480p, затем 360p.
 Фото и карусели (X, TikTok, Xiaohongshu): если в ссылке нет видео, бот достаёт
-картинки и присылает их альбомами по 10 штук.
+картинки и присылает их альбомами по 10 штук, а затем ещё раз - файлами без сжатия
+(Telegram пережимает фото, в файле остаётся оригинал).
+Режим ONLY_REDNOTE=1 отключает скачивание со всех сервисов, кроме Xiaohongshu.
 
 Работает в личных сообщениях и в группах (см. ALLOWED_CHAT_IDS в .env).
 """
@@ -46,6 +48,14 @@ ALLOWED_CHAT_IDS = {
     int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x
 }
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
+
+
+def env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on", "да"}
+
+
+# Если включено, бот качает только с Xiaohongshu (RedNote), остальные ссылки отклоняет.
+ONLY_REDNOTE = env_flag("ONLY_REDNOTE")
 # Для хостинга Render: он задаёт PORT и RENDER_EXTERNAL_URL сам.
 # Если PORT есть, бот поднимает крошечный веб-сервер, а по адресу PING_URL
 # сам себя «пингует», чтобы бесплатный сервис не засыпал.
@@ -83,6 +93,7 @@ SUPPORTED_DOMAINS = (
     "xiaohongshu.com",
     "xhslink.com",
 )
+REDNOTE_DOMAINS = ("xiaohongshu.com", "xhslink.com")
 # Для этих сервисов, если видео нет, пробуем достать фото.
 IMAGE_DOMAINS = (
     "x.com",
@@ -114,7 +125,13 @@ def host_matches(url: str, domains: tuple[str, ...]) -> bool:
 
 
 def is_supported(url: str) -> bool:
+    if ONLY_REDNOTE:
+        return host_matches(url, REDNOTE_DOMAINS)
     return host_matches(url, SUPPORTED_DOMAINS)
+
+
+def services_text() -> str:
+    return "Xiaohongshu" if ONLY_REDNOTE else "X, TikTok, YouTube, Xiaohongshu"
 
 
 def extract_urls(message: Message) -> list[str]:
@@ -327,7 +344,7 @@ def download_images_gallerydl(url: str, workdir: Path) -> list[Path]:
 
 
 def download_images(url: str, workdir: Path) -> list[Path]:
-    if host_matches(url, ("xiaohongshu.com", "xhslink.com")):
+    if host_matches(url, REDNOTE_DOMAINS):
         return download_xhs_images(url, workdir)
     return download_images_gallerydl(url, workdir)
 
@@ -406,25 +423,26 @@ async def send_document_chunk(message: Message, chunk: list[Path]) -> None:
 
 
 async def send_images(message: Message, files: list[Path]) -> None:
-    """Фото уходят альбомами по 10; крупные или нестандартные файлы - документами."""
+    """Сначала фото альбомами по 10 (их удобно листать), затем те же картинки
+    файлами без сжатия. Нестандартные форматы и слишком крупные картинки
+    приходят только файлами, дублировать их не нужно."""
     photos = [
         p for p in files
         if p.suffix.lower() in PHOTO_EXTS and p.stat().st_size <= MAX_PHOTO_BYTES
     ]
-    documents = [p for p in files if p not in photos]
 
     for i in range(0, len(photos), 10):
         chunk = photos[i:i + 10]
         try:
             await send_photo_chunk(message, chunk)
         except TelegramBadRequest as e:
-            # например, слишком большие размеры картинки: шлём без сжатия
-            log.warning("Telegram не принял фото (%s), отправляю документами", e)
-            documents.extend(chunk)
+            # например, слишком большие размеры картинки: уйдёт только файлом
+            log.warning("Telegram не принял фото (%s), отправлю только файлами", e)
         await asyncio.sleep(0.5)
 
-    for i in range(0, len(documents), 10):
-        await send_document_chunk(message, documents[i:i + 10])
+    # Все картинки файлами (оригиналы без сжатия), в том же порядке.
+    for i in range(0, len(files), 10):
+        await send_document_chunk(message, files[i:i + 10])
         await asyncio.sleep(0.5)
 
 
@@ -436,11 +454,19 @@ def allowed(message: Message) -> bool:
     return bool(message.from_user) and message.from_user.id in ALLOWED_IDS
 
 
+DENIED_TEXT = "Извините, бот доступен только участникам тайной секты абрикосов"
+
 dp = Dispatcher()
 
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
+    # В личке команда недоступна никому. В группах её запускают только те,
+    # чей ID пользователя есть в ALLOWED_USER_IDS. Остальным бот не отвечает.
+    if message.chat.type == "private":
+        return
+    if not message.from_user or message.from_user.id not in ALLOWED_IDS:
+        return
     await message.answer(
         f"Твой Telegram ID: {message.from_user.id}\nID этого чата: {message.chat.id}"
     )
@@ -449,13 +475,10 @@ async def cmd_id(message: Message):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if not allowed(message):
-        await message.answer(
-            "Это приватный бот. Если ты его владелец, команда /id покажет твой ID, "
-            "его нужно вписать в ALLOWED_USER_IDS."
-        )
+        await message.answer(DENIED_TEXT)
         return
     await message.answer(
-        "Привет! Пришли ссылку на видео или фото из X, TikTok, YouTube или Xiaohongshu, "
+        f"Привет! Пришли ссылку на видео или фото из сервиса: {services_text()}, "
         "и я пришлю их."
     )
 
@@ -476,8 +499,8 @@ async def handle_message(message: Message):
         if not is_supported(url):
             if is_private:
                 await message.answer(
-                    f"Такой сервис я не знаю: {url}\n"
-                    "Умею: X, TikTok, YouTube, Xiaohongshu."
+                    f"Такой сервис я не знаю или он отключён: {url}\n"
+                    f"Умею: {services_text()}."
                 )
             continue
         await process_url(message, url)
@@ -554,9 +577,12 @@ async def main():
         raise SystemExit("Не задан BOT_TOKEN. Скопируй .env.example в .env и заполни его.")
     if not ALLOWED_IDS and not ALLOWED_CHAT_IDS:
         log.warning(
-            "ALLOWED_USER_IDS и ALLOWED_CHAT_IDS пусты: бот отвечает только на /id. "
-            "Узнай свой ID, впиши его в .env и перезапусти бота."
+            "ALLOWED_USER_IDS и ALLOWED_CHAT_IDS пусты: бот никому не отвечает. "
+            "Узнай свой Telegram ID (например, через @userinfobot), впиши его в .env "
+            "и перезапусти бота."
         )
+    if ONLY_REDNOTE:
+        log.info("Режим ONLY_REDNOTE: скачиваю только с Xiaohongshu")
     if shutil.which("ffmpeg") is None:
         log.warning("ffmpeg не найден: склейка видео и звука работать не будет.")
 
